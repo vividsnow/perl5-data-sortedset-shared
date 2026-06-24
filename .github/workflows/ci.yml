@@ -18,6 +18,7 @@ jobs:
         with:
           perl-version: ${{ matrix.perl }}
       - run: cpanm -n Devel::PPPort
+      - run: cpanm -n https://github.com/vividsnow/perl5-data-intern-shared/archive/master.tar.gz   # for string-keyed (new_strings) tests
       - run: perl Makefile.PL
       - run: make
       - run: make test
@@ -103,6 +104,7 @@ jobs:
         with:
           perl-version: '5.40'
       - run: cpanm -n Devel::PPPort Time::HiRes Test::Pod
+      - run: cpanm -n https://github.com/vividsnow/perl5-data-intern-shared/archive/master.tar.gz   # for string-keyed eg/xt
       - run: perl Makefile.PL && make
       - run: AUTHOR_TESTING=1 prove -b -j2 xt/*.t
         env:

@@ -1,9 +1,19 @@
 package Data::SortedSet::Shared;
 use strict;
 use warnings;
-our $VERSION = '0.01';
+our $VERSION = '0.02';
 require XSLoader;
 XSLoader::load('Data::SortedSet::Shared', $VERSION);
+
+# String-keyed sets: members are arbitrary byte strings instead of int64 ids.
+# Convenience constructor that builds a Data::SortedSet::Shared::Strings, which
+# interns keys to ids via Data::Intern::Shared.
+sub new_strings {
+    my $class = shift;
+    require Data::SortedSet::Shared::Strings;
+    return Data::SortedSet::Shared::Strings->new(@_);
+}
+
 1;
 __END__
 
@@ -49,8 +59,9 @@ Multiple processes can map the same set and read and write it concurrently;
 access is serialized by a write-preferring futex rwlock that recovers
 automatically if a lock holder dies (see L</CRASH SAFETY>).
 
-Members are integers; map arbitrary string keys to ids yourself.  Scores must not
-be NaN.  B<Linux-only>.  Requires 64-bit Perl.
+Members are 64-bit integers.  For B<string-keyed> sets, see L</String-keyed sets>
+and L<Data::SortedSet::Shared::Strings> (bundled).  Scores must not be NaN.
+B<Linux-only>.  Requires 64-bit Perl.
 
 =head1 METHODS
 
@@ -66,6 +77,20 @@ maximum number of members.  When reopening an existing file or memfd, the stored
 header wins and the caller's C<$max> is ignored.  C<new_memfd> creates a Linux
 memfd (transferable via its C<memfd> descriptor); C<new_from_fd> reopens one in
 another process.
+
+=head2 String-keyed sets
+
+    my $z = Data::SortedSet::Shared->new_strings(max => 1_000_000);
+    $z->add("alice", 1500);
+    my @top = $z->rev_range_by_rank(0, 9);    # ("alice", ...)
+
+C<new_strings> returns a L<Data::SortedSet::Shared::Strings> -- the same API as
+this class but with B<string members>.  Keys are interned to dense ids via
+L<Data::Intern::Shared> (a prerequisite of this distribution), so the set is still
+shared across processes by id.  Ties among equal scores break by interning id, not
+lexicographically.  See L<Data::SortedSet::Shared::Strings> for the full options
+(C<set>/C<keys> backing paths, C<max_keys>, C<arena>), and the separate C<wrap>
+constructor that adopts two existing objects.
 
 =head2 Mutators
 
@@ -213,8 +238,10 @@ which is very unlikely in practice but cannot be ruled out.
 
 =head1 SEE ALSO
 
-L<Data::SpatialHash::Shared>, L<Data::HashMap::Shared>, L<Data::Heap::Shared>,
-L<Data::Graph::Shared>, and the rest of the C<Data::*::Shared> family.
+L<Data::SortedSet::Shared::Strings> (string-keyed variant, bundled with this
+distribution), L<Data::Intern::Shared>, L<Data::SpatialHash::Shared>,
+L<Data::HashMap::Shared>, L<Data::Heap::Shared>, L<Data::Graph::Shared>, and the
+rest of the C<Data::*::Shared> family.
 
 =head1 AUTHOR
 

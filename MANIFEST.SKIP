@@ -13,6 +13,6 @@
 ^ppport\.h$
 ^MYMETA\.
 ^MANIFEST\.bak$
-\b\.gitignore$
+(^|/)\.gitignore$
 ^[^/]+\.tar\.gz$
 ~$
