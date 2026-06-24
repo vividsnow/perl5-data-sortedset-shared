@@ -31,5 +31,8 @@ cmp_ok $s->{height}, '>=', 1, 'stats: height';
 cmp_ok $s->{nodes_used}, '>=', 1, 'stats: nodes_used';
 ok $s->{index_load} > 0 && $s->{index_load} < 1, 'stats: index_load';
 cmp_ok $s->{mmap_size}, '>', 0, 'stats: mmap_size';
+cmp_ok $s->{ops}, '>=', 1, 'stats: ops counter incremented';
+cmp_ok $s->{node_capacity}, '>=', $s->{nodes_used}, 'stats: node_capacity >= nodes_used';
+cmp_ok $s->{index_slots}, '>', 0, 'stats: index_slots';
 
 done_testing;
