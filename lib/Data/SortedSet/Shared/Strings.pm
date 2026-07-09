@@ -5,7 +5,7 @@ use Carp ();
 use Data::Intern::Shared ();
 use Data::SortedSet::Shared ();
 
-our $VERSION = '0.02';
+our $VERSION = '0.03';
 
 # ---- construction ----
 
