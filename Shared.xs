@@ -9,7 +9,18 @@
     if (!sv_isobject(sv) || !sv_derived_from(sv, "Data::SortedSet::Shared")) \
         croak("Expected a Data::SortedSet::Shared object"); \
     SsHandle *h = INT2PTR(SsHandle*, SvIV(SvRV(sv))); \
-    if (!h) croak("Attempted to use a destroyed Data::SortedSet::Shared object")
+    if (!h) croak("Attempted to use a destroyed Data::SortedSet::Shared object"); \
+    sv_2mortal(SvREFCNT_inc(SvRV(sv)))
+
+/* Re-read the handle after a call that can run Perl code (tied/overloaded
+ * argument magic, tied-array fetches).  That code may call $obj->DESTROY
+ * explicitly, which frees the handle and zeroes the IV; EXTRACT's mortal
+ * pins the referent only against refcount-driven destruction, not an
+ * explicit DESTROY, so the local `h` would dangle.  Used only where magic
+ * can actually intervene between EXTRACT and the first use of h. */
+#define REEXTRACT(sv) \
+    h = INT2PTR(SsHandle*, SvIV(SvRV(sv))); \
+    if (!h) croak("Data::SortedSet::Shared object destroyed during the call")
 
 #define MAKE_OBJ(class, handle) \
     SV *obj = newSViv(PTR2IV(handle)); \
@@ -68,9 +79,11 @@ new(class, path, max_entries, ...)
   PREINIT:
     char errbuf[SS_ERR_BUFLEN];
   CODE:
-    const char *p = (SvGETMAGIC(path), SvOK(path)) ? SvPV_nolen(path) : NULL;
     if (max_entries > UINT32_MAX) croak("Data::SortedSet::Shared->new: max_entries exceeds 2^32");
+    /* resolve the trailing optional mode BEFORE capturing the path PV: its
+       get-magic runs arbitrary Perl that can realloc/free path's PV */
     mode_t mode = (items > 3 && (SvGETMAGIC(ST(3)), SvOK(ST(3)))) ? (mode_t)SvUV(ST(3)) : 0600;
+    const char *p = (SvGETMAGIC(path), SvOK(path)) ? SvPV_nolen(path) : NULL;
     SsHandle *h = ss_create(p, (uint32_t)max_entries, mode, errbuf);
     if (!h) croak("Data::SortedSet::Shared->new: %s", errbuf);
     MAKE_OBJ(class, h);
@@ -80,13 +93,16 @@ new(class, path, max_entries, ...)
 SV *
 new_memfd(class, name, max_entries)
     const char *class
-    const char *name
+    SV *name
     UV max_entries
   PREINIT:
     char errbuf[SS_ERR_BUFLEN];
   CODE:
     if (max_entries > UINT32_MAX) croak("Data::SortedSet::Shared->new_memfd: max_entries exceeds 2^32");
-    SsHandle *h = ss_create_memfd(name, (uint32_t)max_entries, errbuf);
+    /* capture the name PV here, AFTER the max_entries INPUT conversion: its
+       get-magic runs arbitrary Perl that can realloc/free name's PV */
+    const char *nm = (SvGETMAGIC(name), SvOK(name)) ? SvPV_nolen(name) : NULL;
+    SsHandle *h = ss_create_memfd(nm, (uint32_t)max_entries, errbuf);
     if (!h) croak("Data::SortedSet::Shared->new_memfd: %s", errbuf);
     MAKE_OBJ(class, h);
   OUTPUT:
@@ -278,10 +294,14 @@ rank(self, member)
     EXTRACT(self);
     double sc;
   CODE:
+    {
+    UV rk = 0; int found;
     ss_rwlock_rdlock(h);
-    RETVAL = ss_idx_get(h, (int64_t)member, &sc)
-        ? newSVuv(ss_rank_of(h, sc, (int64_t)member)) : &PL_sv_undef;
+    found = ss_idx_get(h, (int64_t)member, &sc);
+    if (found) rk = ss_rank_of(h, sc, (int64_t)member);
     ss_rwlock_rdunlock(h);
+    RETVAL = found ? newSVuv(rk) : &PL_sv_undef;   /* build SV after unlock: an OOM in newSVuv must not strand the read lock */
+    }
   OUTPUT:
     RETVAL
 
@@ -293,10 +313,14 @@ rev_rank(self, member)
     EXTRACT(self);
     double sc;
   CODE:
+    {
+    UV rk = 0; int found;
     ss_rwlock_rdlock(h);
-    RETVAL = ss_idx_get(h, (int64_t)member, &sc)
-        ? newSVuv(h->hdr->count - 1 - ss_rank_of(h, sc, (int64_t)member)) : &PL_sv_undef;
+    found = ss_idx_get(h, (int64_t)member, &sc);
+    if (found) rk = h->hdr->count - 1 - ss_rank_of(h, sc, (int64_t)member);
     ss_rwlock_rdunlock(h);
+    RETVAL = found ? newSVuv(rk) : &PL_sv_undef;   /* build SV after unlock */
+    }
   OUTPUT:
     RETVAL
 
@@ -307,16 +331,20 @@ at_rank(self, rank)
   PREINIT:
     EXTRACT(self);
   CODE:
+    {
+    IV val = 0; int found = 0;
     ss_rwlock_rdlock(h);
     {
         uint32_t cnt = h->hdr->count;
         IV r = rank; if (r < 0) r += (IV)cnt;
         if (r >= 0 && (uint64_t)r < cnt) {          /* compare in 64-bit; large r must not truncate to an in-range index */
             int pos; uint32_t leaf = ss_at_rank(h, (uint32_t)r, &pos);
-            RETVAL = (leaf != SS_NONE) ? newSViv((IV)h->nodes[leaf].members[pos]) : &PL_sv_undef;
-        } else RETVAL = &PL_sv_undef;
+            if (leaf != SS_NONE) { val = (IV)h->nodes[leaf].members[pos]; found = 1; }
+        }
     }
     ss_rwlock_rdunlock(h);
+    RETVAL = found ? newSViv(val) : &PL_sv_undef;   /* build SV after unlock */
+    }
   OUTPUT:
     RETVAL
 
@@ -344,6 +372,7 @@ range_by_rank(self, start, stop, ...)
   PPCODE:
     int ws = 0;
     ss_parse_range_opts(aTHX_ &ST(0), 3, items, &ws, NULL, NULL);
+    REEXTRACT(self);
     ss_rwlock_rdlock(h);
     {
         uint32_t s0 = 0, len = 0;
@@ -362,6 +391,7 @@ rev_range_by_rank(self, start, stop, ...)
   PPCODE:
     int ws = 0;
     ss_parse_range_opts(aTHX_ &ST(0), 3, items, &ws, NULL, NULL);
+    REEXTRACT(self);
     ss_rwlock_rdlock(h);
     {
         uint32_t cnt = h->hdr->count, s0 = 0, len = 0;
@@ -380,6 +410,7 @@ range_by_score(self, min, max, ...)
   PPCODE:
     int ws = 0; IV limit = -1, offset = 0;
     ss_parse_range_opts(aTHX_ &ST(0), 3, items, &ws, &limit, &offset);
+    REEXTRACT(self);
     ss_rwlock_rdlock(h);
     {
         uint32_t lo;
@@ -400,6 +431,7 @@ rev_range_by_score(self, max, min, ...)
   PPCODE:
     int ws = 0; IV limit = -1, offset = 0;
     ss_parse_range_opts(aTHX_ &ST(0), 3, items, &ws, &limit, &offset);
+    REEXTRACT(self);
     ss_rwlock_rdlock(h);
     {
         uint32_t lo;
@@ -450,9 +482,11 @@ each(self, cb)
   PREINIT:
     EXTRACT(self);
   CODE:
+    SvGETMAGIC(cb);   /* a tied/overloaded scalar may FETCH to a coderef */
     if (!SvROK(cb) || SvTYPE(SvRV(cb)) != SVt_PVCV) croak("each: callback must be a code ref");
     {
         ss_rcollect_t col = { NULL, NULL, 0, 0 };
+        REEXTRACT(self);
         ss_rwlock_rdlock(h);
         int ok = ss_collect_range(h, 0, h->hdr->count, 0, &col);
         ss_rwlock_rdunlock(h);
@@ -564,27 +598,47 @@ add_many(self, rows)
     EXTRACT(self);
     int added = 0;
   CODE:
+    SvGETMAGIC(rows);
     if (!SvROK(rows) || SvTYPE(SvRV(rows)) != SVt_PVAV)
         croak("add_many: expected an arrayref of [member, score] rows");
     {
         AV *av = (AV *)SvRV(rows);
         SSize_t nr = av_len(av) + 1;
+        int64_t *mem = NULL;
+        double *sco = NULL;
+        SSize_t n = 0;
+        /* Resolve ALL user-SV conversions (SvIV/SvNV run get-magic/overload =
+         * arbitrary Perl that can die/longjmp) into plain C arrays BEFORE taking
+         * the lock; inside the lock do ONLY pure C so a conversion can never
+         * abandon a held wrlock and permanently deadlock the mapping. */
+        if (nr > 0) {
+            Newx(mem, nr, int64_t); SAVEFREEPV(mem);   /* freed on return OR a longjmp from SvNV/SvIV magic */
+            Newx(sco, nr, double);  SAVEFREEPV(sco);
+            for (SSize_t i = 0; i < nr; i++) {
+                SV **rv = av_fetch(av, i, 0);
+                if (rv) SvGETMAGIC(*rv);   /* a tied-array element is a deferred-magic PVLV */
+                if (!rv || !SvROK(*rv) || SvTYPE(SvRV(*rv)) != SVt_PVAV) continue;   /* skip malformed */
+                AV *row = (AV *)SvRV(*rv);
+                if (av_len(row) + 1 < 2) continue;
+                SV **ms = av_fetch(row, 0, 0), **sv = av_fetch(row, 1, 0);
+                if (!ms || !sv) continue;
+                double score = SvNV(*sv);
+                if (score != score) continue;                                       /* skip NaN */
+                mem[n] = (int64_t)SvIV(*ms);
+                sco[n] = score;
+                n++;
+            }
+        }
+        REEXTRACT(self);
         ss_rwlock_wrlock(h);
-        for (SSize_t i = 0; i < nr; i++) {
-            SV **rv = av_fetch(av, i, 0);
-            if (!rv || !SvROK(*rv) || SvTYPE(SvRV(*rv)) != SVt_PVAV) continue;   /* skip malformed */
-            AV *row = (AV *)SvRV(*rv);
-            if (av_len(row) + 1 < 2) continue;
-            SV **ms = av_fetch(row, 0, 0), **sv = av_fetch(row, 1, 0);
-            if (!ms || !sv) continue;
-            double score = SvNV(*sv);
-            if (score != score) continue;                                       /* skip NaN */
-            int rc = ss_add_locked(h, (int64_t)SvIV(*ms), score);
+        for (SSize_t i = 0; i < n; i++) {
+            int rc = ss_add_locked(h, mem[i], sco[i]);
             if (rc == 1) added++;
             else if (rc == -1) break;                                           /* pool full */
         }
         __atomic_fetch_add(&h->hdr->stat_ops, 1, __ATOMIC_RELAXED);
         ss_rwlock_wrunlock(h);
+        /* mem/sco freed by SAVEFREEPV at scope exit (croak-safe) */
     }
     RETVAL = added;
   OUTPUT:
@@ -597,25 +651,37 @@ stats(self)
     EXTRACT(self);
   CODE:
     {
-        HV *hv = newHV();
+        uint32_t count, max_entries, height, node_capacity, index_slots, nodes_used;
+        uint64_t ops;
+        /* Snapshot the header fields under the lock; do all (croak-capable) Perl
+           allocation after releasing it -- an OOM in newHV/newSVuv must never
+           strand the read lock. */
         ss_rwlock_rdlock(h);
         SsHeader *hd = h->hdr;
         uint32_t nfree = 0, f = hd->node_free_head;
         /* node_free_head / parent free-links are file-stored: bound the index and
            cap iterations so a crafted out-of-range or cyclic free-list can't OOB
            or spin (never taken for a valid free-list of length <= node_capacity) */
-        while (f != SS_NONE && ss_node_ok(h, f) && nfree <= hd->node_capacity) { nfree++; f = h->nodes[f].parent; }
-        uint32_t iload = hd->count;   /* backward-shift delete leaves no tombstones: occupied slots == count */
-        hv_stores(hv, "count",         newSVuv(hd->count));
-        hv_stores(hv, "max_entries",   newSVuv(hd->max_entries));
-        hv_stores(hv, "height",        newSVuv(hd->height));
-        hv_stores(hv, "node_capacity", newSVuv(hd->node_capacity));
-        hv_stores(hv, "nodes_used",    newSVuv(hd->node_capacity - nfree));
-        hv_stores(hv, "index_slots",   newSVuv(hd->index_slots));
-        hv_stores(hv, "index_load",    newSVnv((double)iload / (double)hd->index_slots));
-        hv_stores(hv, "ops",           newSVuv(hd->stat_ops));
-        hv_stores(hv, "mmap_size",     newSVuv((UV)h->mmap_size));
+        while (f != SS_NONE && ss_node_ok(h, f) && nfree <= h->node_capacity) { nfree++; f = h->nodes[f].parent; }   /* cached cap: trusted anti-spin bound */
+        count         = hd->count;   /* backward-shift delete leaves no tombstones: occupied slots == count */
+        max_entries   = hd->max_entries;
+        height        = hd->height;
+        node_capacity = hd->node_capacity;
+        index_slots   = hd->index_slots;
+        nodes_used    = hd->node_capacity - nfree;
+        ops           = hd->stat_ops;
         ss_rwlock_rdunlock(h);
+
+        HV *hv = newHV();
+        hv_stores(hv, "count",         newSVuv(count));
+        hv_stores(hv, "max_entries",   newSVuv(max_entries));
+        hv_stores(hv, "height",        newSVuv(height));
+        hv_stores(hv, "node_capacity", newSVuv(node_capacity));
+        hv_stores(hv, "nodes_used",    newSVuv(nodes_used));
+        hv_stores(hv, "index_slots",   newSVuv(index_slots));
+        hv_stores(hv, "index_load",    newSVnv((double)count / (double)index_slots));
+        hv_stores(hv, "ops",           newSVuv(ops));
+        hv_stores(hv, "mmap_size",     newSVuv((UV)h->mmap_size));
         RETVAL = newRV_noinc((SV *)hv);
     }
   OUTPUT:
