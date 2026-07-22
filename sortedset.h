@@ -862,29 +862,49 @@ static inline void ss_node_free(SsHandle *h, uint32_t idx) {
     h->hdr->node_free_head = idx;
 }
 
+/* node indices stored in the mmap (children[], leftmost,
+ * rightmost, leaf next/prev, free-list links) are attacker-controlled -- a
+ * local peer can write the backing file. Bound every such index against the
+ * node pool before using it to dereference h->nodes[]. A predictable
+ * never-taken branch for valid data; on a bad index the caller stops/skips
+ * instead of trapping. */
+static inline int ss_node_ok(const SsHandle *h, uint32_t idx) {
+    return idx < h->node_capacity;   /* cached geometry, not peer-writable header */
+}
+
 /* ---- member -> score index (open addressing, linear probe) ---- */
 /* returns the slot of `member` (if present) or the first empty slot for it;
-   *found (optional, may be NULL) says which */
+   *found (optional, may be NULL) says which.  Returns SS_NONE with *found == 0
+   when every slot reads occupied and `member` is absent.  Create-time sizing
+   keeps the load factor <= 0.7, so an all-occupied table means a lock-violating
+   peer has scribbled over the state bytes -- but the probe must still be
+   bounded by the table size: an unbounded one spins forever while holding the
+   lock, hanging every process that shares the segment. */
 static inline uint32_t ss_idx_find(SsHandle *h, int64_t member, int *found) {
     uint32_t mask = h->index_slots - 1;   /* cached geometry, not peer-writable header */
     uint32_t i = (uint32_t)(ss_hash_member(member) & mask);
-    while (h->index[i].state) {
+    for (uint32_t probe = 0; probe < h->index_slots; probe++) {
+        if (!h->index[i].state) { if (found) *found = 0; return i; }
         if (h->index[i].member == member) { if (found) *found = 1; return i; }
         i = (i + 1) & mask;
     }
     if (found) *found = 0;
-    return i;
+    return SS_NONE;   /* corrupt full table */
 }
 static inline int ss_idx_get(SsHandle *h, int64_t member, double *score) {
     int f; uint32_t i = ss_idx_find(h, member, &f);
     if (f) { *score = h->index[i].score; return 1; }
     return 0;
 }
-static inline void ss_idx_set(SsHandle *h, int64_t member, double score) {
+/* returns 0 when the (corrupt) index has no free slot for an absent member --
+   the caller must fail the operation instead of clobbering an arbitrary slot */
+static inline int ss_idx_set(SsHandle *h, int64_t member, double score) {
     uint32_t i = ss_idx_find(h, member, NULL);
+    if (i == SS_NONE) return 0;
     h->index[i].member = member;
     h->index[i].score  = score;
     h->index[i].state  = 1;
+    return 1;
 }
 
 /* ---- B+tree ---- */
@@ -926,20 +946,24 @@ static SsSplit ss_insert_rec(SsHandle *h, uint32_t nidx, double score, int64_t m
         for (int i = 0; i < rc; i++) { rn->scores[i] = nd->scores[mid+i]; rn->members[i] = nd->members[mid+i]; }
         rn->num = (uint16_t)rc; nd->num = (uint16_t)mid;
         rn->next = nd->next; rn->prev = nidx;
-        if (nd->next != SS_NONE) h->nodes[nd->next].prev = ridx; else h->hdr->rightmost = ridx;
+        if (nd->next == SS_NONE) h->hdr->rightmost = ridx;
+        else if (ss_node_ok(h, nd->next)) h->nodes[nd->next].prev = ridx;
+        /* corrupt next link: skip the backlink fix rather than a wild write */
         nd->next = ridx;
         r.split = 1; r.rnode = ridx; r.rscore = rn->scores[0]; r.rmember = rn->members[0];
         return r;
     }
     int c = ss_child_index(nd, score, member);
-    SsSplit cr = ss_insert_rec(h, nd->children[c], score, member);
+    uint32_t cidx = nd->children[c];
+    if (!ss_node_ok(h, cidx)) return r;   /* Layer B: corrupt child index -- stop instead of a wild descent */
+    SsSplit cr = ss_insert_rec(h, cidx, score, member);
     if (!cr.split) { nd->counts[c]++; return r; }
     for (int i = nd->num; i > c + 1; i--) { nd->children[i] = nd->children[i-1]; nd->counts[i] = nd->counts[i-1]; }
     for (int i = nd->num - 1; i > c; i--) { nd->scores[i] = nd->scores[i-1]; nd->members[i] = nd->members[i-1]; }
     nd->scores[c] = cr.rscore; nd->members[c] = cr.rmember;
     nd->children[c+1] = cr.rnode; h->nodes[cr.rnode].parent = nidx;
     nd->num++;
-    nd->counts[c]   = ss_node_total(&h->nodes[nd->children[c]]);
+    nd->counts[c]   = ss_node_total(&h->nodes[cidx]);
     nd->counts[c+1] = ss_node_total(&h->nodes[cr.rnode]);
     if (nd->num <= SS_ORDER) return r;
     uint32_t ridx = ss_node_alloc(h);
@@ -949,7 +973,7 @@ static SsSplit ss_insert_rec(SsHandle *h, uint32_t nidx, double score, int64_t m
     for (int i = 0; i < rch; i++) {
         rn->children[i] = nd->children[midc+i];
         rn->counts[i]   = nd->counts[midc+i];
-        h->nodes[rn->children[i]].parent = ridx;
+        if (ss_node_ok(h, rn->children[i])) h->nodes[rn->children[i]].parent = ridx;   /* skip a corrupt child index */
     }
     for (int i = 0; i < rch - 1; i++) { rn->scores[i] = nd->scores[midc+i]; rn->members[i] = nd->members[midc+i]; }
     rn->num = (uint16_t)rch;
@@ -970,6 +994,7 @@ static void ss_tree_add(SsHandle *h, double score, int64_t member) {
         hdr->count++;
         return;
     }
+    if (!ss_node_ok(h, hdr->root)) return;   /* Layer B: corrupt root index -- refuse the descent */
     SsSplit r = ss_insert_rec(h, hdr->root, score, member);
     if (r.split) {
         uint32_t nr = ss_node_alloc(h);
@@ -992,7 +1017,10 @@ static void ss_idx_del(SsHandle *h, int64_t member) {
     int f; uint32_t i = ss_idx_find(h, member, &f);
     if (!f) return;
     uint32_t j = i;
-    for (;;) {
+    /* bounded by the table size: the shift scan stops at the first empty slot,
+       but a corrupt all-occupied table has none and must not spin forever
+       under the lock */
+    for (uint32_t probe = 0; probe < h->index_slots; probe++) {
         j = (j + 1) & mask;
         if (!h->index[j].state) break;
         uint32_t k = (uint32_t)(ss_hash_member(h->index[j].member) & mask);
@@ -1007,15 +1035,18 @@ static void ss_idx_del(SsHandle *h, int64_t member) {
 static void ss_merge(SsHandle *h, uint32_t pidx, int c) {
     SsNode *p = &h->nodes[pidx];
     uint32_t lidx = p->children[c], ridx = p->children[c+1];
+    if (!ss_node_ok(h, lidx) || !ss_node_ok(h, ridx)) return;   /* Layer B: corrupt child index */
     SsNode *ln = &h->nodes[lidx], *rn = &h->nodes[ridx];
     if (ln->is_leaf) {
         for (int i = 0; i < rn->num; i++) { ln->scores[ln->num+i] = rn->scores[i]; ln->members[ln->num+i] = rn->members[i]; }
         ln->next = rn->next;
-        if (rn->next != SS_NONE) h->nodes[rn->next].prev = lidx; else h->hdr->rightmost = lidx;
+        if (rn->next == SS_NONE) h->hdr->rightmost = lidx;
+        else if (ss_node_ok(h, rn->next)) h->nodes[rn->next].prev = lidx;
+        /* corrupt next link: skip the backlink fix rather than a wild write */
         ln->num = (uint16_t)(ln->num + rn->num);
     } else {
         ln->scores[ln->num-1] = p->scores[c]; ln->members[ln->num-1] = p->members[c];   /* pull separator down */
-        for (int i = 0; i < rn->num; i++) { ln->children[ln->num+i] = rn->children[i]; ln->counts[ln->num+i] = rn->counts[i]; h->nodes[rn->children[i]].parent = lidx; }
+        for (int i = 0; i < rn->num; i++) { ln->children[ln->num+i] = rn->children[i]; ln->counts[ln->num+i] = rn->counts[i]; if (ss_node_ok(h, rn->children[i])) h->nodes[rn->children[i]].parent = lidx; }
         for (int i = 0; i < rn->num - 1; i++) { ln->scores[ln->num+i] = rn->scores[i]; ln->members[ln->num+i] = rn->members[i]; }
         ln->num = (uint16_t)(ln->num + rn->num);
     }
@@ -1030,9 +1061,12 @@ static void ss_merge(SsHandle *h, uint32_t pidx, int c) {
 static void ss_fix_underflow(SsHandle *h, uint32_t pidx, int c) {
     SsNode *p = &h->nodes[pidx];
     uint32_t cidx = p->children[c];
+    if (!ss_node_ok(h, cidx)) return;   /* Layer B: corrupt child index */
     SsNode *cn = &h->nodes[cidx];
     if (c > 0) {
-        uint32_t lidx = p->children[c-1]; SsNode *ln = &h->nodes[lidx];
+        uint32_t lidx = p->children[c-1];
+        if (!ss_node_ok(h, lidx)) return;   /* Layer B: corrupt sibling index */
+        SsNode *ln = &h->nodes[lidx];
         if (ln->num > SS_MIN) {                       /* borrow from left */
             if (cn->is_leaf) {
                 for (int i = cn->num; i > 0; i--) { cn->scores[i] = cn->scores[i-1]; cn->members[i] = cn->members[i-1]; }
@@ -1046,7 +1080,7 @@ static void ss_fix_underflow(SsHandle *h, uint32_t pidx, int c) {
                 for (int i = cn->num-1; i > 0; i--) { cn->scores[i] = cn->scores[i-1]; cn->members[i] = cn->members[i-1]; }
                 cn->scores[0] = p->scores[c-1]; cn->members[0] = p->members[c-1];
                 cn->children[0] = ln->children[ln->num-1]; cn->counts[0] = moved;
-                h->nodes[cn->children[0]].parent = cidx;
+                if (ss_node_ok(h, cn->children[0])) h->nodes[cn->children[0]].parent = cidx;   /* skip a corrupt borrowed child */
                 cn->num++;
                 p->scores[c-1] = ln->scores[ln->num-2]; p->members[c-1] = ln->members[ln->num-2];
                 ln->num--;
@@ -1056,7 +1090,9 @@ static void ss_fix_underflow(SsHandle *h, uint32_t pidx, int c) {
         }
     }
     if (c < p->num - 1) {
-        uint32_t ridx = p->children[c+1]; SsNode *rn = &h->nodes[ridx];
+        uint32_t ridx = p->children[c+1];
+        if (!ss_node_ok(h, ridx)) return;   /* Layer B: corrupt sibling index */
+        SsNode *rn = &h->nodes[ridx];
         if (rn->num > SS_MIN) {                       /* borrow from right */
             if (cn->is_leaf) {
                 cn->scores[cn->num] = rn->scores[0]; cn->members[cn->num] = rn->members[0]; cn->num++;
@@ -1068,7 +1104,7 @@ static void ss_fix_underflow(SsHandle *h, uint32_t pidx, int c) {
                 uint32_t moved = rn->counts[0];
                 cn->scores[cn->num-1] = p->scores[c]; cn->members[cn->num-1] = p->members[c];
                 cn->children[cn->num] = rn->children[0]; cn->counts[cn->num] = moved;
-                h->nodes[cn->children[cn->num]].parent = cidx;
+                if (ss_node_ok(h, cn->children[cn->num])) h->nodes[cn->children[cn->num]].parent = cidx;   /* skip a corrupt borrowed child */
                 cn->num++;
                 p->scores[c] = rn->scores[0]; p->members[c] = rn->members[0];
                 for (int i = 0; i+1 < rn->num; i++) { rn->children[i] = rn->children[i+1]; rn->counts[i] = rn->counts[i+1]; }
@@ -1094,7 +1130,9 @@ static int ss_delete_rec(SsHandle *h, uint32_t nidx, double score, int64_t membe
         return nd->num < SS_MIN;
     }
     int c = ss_child_index(nd, score, member);
-    int under = ss_delete_rec(h, nd->children[c], score, member);
+    uint32_t cidx = nd->children[c];
+    if (!ss_node_ok(h, cidx)) return 0;   /* Layer B: corrupt child index -- stop, report no underflow */
+    int under = ss_delete_rec(h, cidx, score, member);
     nd->counts[c]--;
     if (under) ss_fix_underflow(h, nidx, c);
     return nd->num < SS_MIN;
@@ -1113,7 +1151,13 @@ static void ss_tree_del(SsHandle *h, double score, int64_t member) {
     } else if (root->num == 1) {
         uint32_t child = root->children[0];
         ss_node_free(h, hdr->root);
-        hdr->root = child; h->nodes[child].parent = SS_NONE; hdr->height--;
+        if (ss_node_ok(h, child)) {
+            hdr->root = child; h->nodes[child].parent = SS_NONE; hdr->height--;
+        } else {
+            /* Layer B: corrupt child index -- drop the tree rather than point
+               the root outside the node pool */
+            hdr->root = SS_NONE; hdr->leftmost = SS_NONE; hdr->rightmost = SS_NONE; hdr->height = 0;
+        }
     }
     hdr->count--;
 }
@@ -1133,7 +1177,7 @@ static int ss_add_locked(SsHandle *h, int64_t member, double score) {
     if (h->hdr->count >= h->hdr->max_entries) return -1;
     if (!ss_add_has_headroom(h)) return -1;
     ss_tree_add(h, score, member);
-    ss_idx_set(h, member, score);
+    if (!ss_idx_set(h, member, score)) return -1;   /* corrupt full index: fail the add */
     return 1;
 }
 
@@ -1163,18 +1207,9 @@ static int ss_incr_locked(SsHandle *h, int64_t member, double delta, double *out
     *out = delta;
     if (delta != delta) return -2;
     if (!ss_add_has_headroom(h)) return -1;
-    ss_tree_add(h, delta, member); ss_idx_set(h, member, delta);
+    ss_tree_add(h, delta, member);
+    if (!ss_idx_set(h, member, delta)) return -1;   /* corrupt full index: fail the incr */
     return 1;
-}
-
-/* node indices stored in the mmap (children[], leftmost,
- * rightmost, leaf next/prev, free-list links) are attacker-controlled -- a
- * local peer can write the backing file. Bound every such index against the
- * node pool before using it to dereference h->nodes[]. A predictable
- * never-taken branch for valid data; on a bad index the caller stops/skips
- * instead of trapping. */
-static inline int ss_node_ok(const SsHandle *h, uint32_t idx) {
-    return idx < h->node_capacity;   /* cached geometry, not peer-writable header */
 }
 
 /* pop the min (max=0) or max (max=1): 0 if empty, else 1 with *m,*s */

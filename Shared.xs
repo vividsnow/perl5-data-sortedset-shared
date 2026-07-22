@@ -609,6 +609,11 @@ add_many(self, rows)
         croak("add_many: expected an arrayref of [member, score] rows");
     {
         AV *av = (AV *)SvRV(rows);
+        /* Pin the array for the whole resolve loop: an element's magic can
+         * drop the caller's last reference (undef $aref from an overload
+         * handler mutates ST(1) itself, because Perl passes aliases), freeing
+         * av and dangling every later av_fetch on it. */
+        SvREFCNT_inc((SV *)av); sv_2mortal((SV *)av);
         SSize_t nr = av_len(av) + 1;
         int64_t *mem = NULL;
         double *sco = NULL;
@@ -622,15 +627,25 @@ add_many(self, rows)
             Newx(sco, nr, double);  SAVEFREEPV(sco);
             for (SSize_t i = 0; i < nr; i++) {
                 SV **rv = av_fetch(av, i, 0);
-                if (rv) SvGETMAGIC(*rv);   /* a tied-array element is a deferred-magic PVLV */
-                if (!rv || !SvROK(*rv) || SvTYPE(SvRV(*rv)) != SVt_PVAV) continue;   /* skip malformed */
-                AV *row = (AV *)SvRV(*rv);
+                if (!rv) continue;
+                SV *rsv = *rv;
+                SvREFCNT_inc(rsv); sv_2mortal(rsv);   /* FETCH magic can drop the element from av */
+                SvGETMAGIC(rsv);   /* a tied-array element is a deferred-magic PVLV */
+                if (!SvROK(rsv) || SvTYPE(SvRV(rsv)) != SVt_PVAV) continue;   /* skip malformed */
+                AV *row = (AV *)SvRV(rsv);
+                SvREFCNT_inc((SV *)row); sv_2mortal((SV *)row);   /* element magic below can free the row AV */
                 if (av_len(row) + 1 < 2) continue;
                 SV **ms = av_fetch(row, 0, 0), **sv = av_fetch(row, 1, 0);
                 if (!ms || !sv) continue;
-                double score = SvNV(*sv);
+                /* Pin both element SVs by value BEFORE any magic runs: the
+                 * score's SvNV can free or reassign the row AV, dangling the
+                 * other's raw SV** slot. */
+                SV *memsv = *ms, *scosv = *sv;
+                SvREFCNT_inc(memsv); sv_2mortal(memsv);
+                SvREFCNT_inc(scosv); sv_2mortal(scosv);
+                double score = SvNV(scosv);
                 if (score != score) continue;                                       /* skip NaN */
-                mem[n] = (int64_t)SvIV(*ms);
+                mem[n] = (int64_t)SvIV(memsv);
                 sco[n] = score;
                 n++;
             }
