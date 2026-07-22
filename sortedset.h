@@ -836,6 +836,27 @@ static inline uint32_t ss_node_alloc(SsHandle *h) {
     h->hdr->node_free_head = h->nodes[idx].parent;
     return idx;
 }
+/* Layer B: the free list head and links live in peer-writable shared memory, so
+ * ss_node_alloc can legitimately return SS_NONE (exhausted OR corrupt). The
+ * write paths cannot unwind a half-done split, so callers must confirm the
+ * worst case is available BEFORE mutating anything -- otherwise a split would
+ * write through &h->nodes[SS_NONE], far outside the mapping.
+ * Walks at most `need` links, so a corrupt free list containing a cycle is
+ * bounded here too. */
+static inline int ss_nodes_available(const SsHandle *h, uint32_t need) {
+    uint32_t idx = h->hdr->node_free_head;
+    for (uint32_t i = 0; i < need; i++) {
+        if (idx == SS_NONE || idx >= h->node_capacity) return 0;
+        idx = h->nodes[idx].parent;
+    }
+    return 1;
+}
+
+/* An insert splits at most once per level and may add a new root. */
+static inline int ss_add_has_headroom(const SsHandle *h) {
+    return ss_nodes_available(h, h->hdr->height + 2);
+}
+
 static inline void ss_node_free(SsHandle *h, uint32_t idx) {
     h->nodes[idx].parent = h->hdr->node_free_head;
     h->hdr->node_free_head = idx;
@@ -1101,10 +1122,16 @@ static void ss_tree_del(SsHandle *h, double score, int64_t member) {
 static int ss_add_locked(SsHandle *h, int64_t member, double score) {
     double old;
     if (ss_idx_get(h, member, &old)) {
-        if (old != score) { ss_tree_del(h, old, member); ss_tree_add(h, score, member); ss_idx_set(h, member, score); }
+        if (old != score) {
+            /* re-insert: check headroom BEFORE the delete, so a refusal leaves
+               the set untouched rather than dropping the member */
+            if (!ss_add_has_headroom(h)) return -1;
+            ss_tree_del(h, old, member); ss_tree_add(h, score, member); ss_idx_set(h, member, score);
+        }
         return 0;
     }
     if (h->hdr->count >= h->hdr->max_entries) return -1;
+    if (!ss_add_has_headroom(h)) return -1;
     ss_tree_add(h, score, member);
     ss_idx_set(h, member, score);
     return 1;
@@ -1126,12 +1153,16 @@ static int ss_incr_locked(SsHandle *h, int64_t member, double delta, double *out
     if (ss_idx_get(h, member, &old)) {
         double ns = old + delta; *out = ns;
         if (ns != ns) return -2;
-        if (ns != old) { ss_tree_del(h, old, member); ss_tree_add(h, ns, member); ss_idx_set(h, member, ns); }
+        if (ns != old) {
+            if (!ss_add_has_headroom(h)) return -1;
+            ss_tree_del(h, old, member); ss_tree_add(h, ns, member); ss_idx_set(h, member, ns);
+        }
         return 0;
     }
     if (h->hdr->count >= h->hdr->max_entries) return -1;
     *out = delta;
     if (delta != delta) return -2;
+    if (!ss_add_has_headroom(h)) return -1;
     ss_tree_add(h, delta, member); ss_idx_set(h, member, delta);
     return 1;
 }
