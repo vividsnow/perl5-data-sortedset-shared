@@ -10,6 +10,7 @@
         croak("Expected a Data::SortedSet::Shared object"); \
     SsHandle *h = INT2PTR(SsHandle*, SvIV(SvRV(sv))); \
     if (!h) croak("Attempted to use a destroyed Data::SortedSet::Shared object"); \
+    SsHandle *h0 = h; PERL_UNUSED_VAR(h0); \
     sv_2mortal(SvREFCNT_inc(SvRV(sv)))
 
 /* Re-read the handle after a call that can run Perl code (tied/overloaded
@@ -26,7 +27,7 @@
     if (!SvROK(sv)) \
         croak("Data::SortedSet::Shared object was replaced during the call"); \
     h = INT2PTR(SsHandle*, SvIV(SvRV(sv))); \
-    if (!h) croak("Data::SortedSet::Shared object destroyed during the call")
+    if (h != h0) croak("Data::SortedSet::Shared object replaced or destroyed during the call")
 
 #define MAKE_OBJ(class, handle) \
     SV *obj = newSViv(PTR2IV(handle)); \
