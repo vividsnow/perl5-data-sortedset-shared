@@ -41,7 +41,7 @@
 #define EMIT_COLLECTED(S0, LEN, REV, WS) STMT_START { \
     ss_rcollect_t col = { NULL, NULL, 0, 0 }; \
     int ok_ = ss_collect_range(h, (S0), (LEN), (REV), &col); \
-    ss_rwlock_rdunlock(h); \
+    if (!h->readonly) ss_rwlock_rdunlock(h);   /* frozen view took no read lock */ \
     if (!ok_) { free(col.members); free(col.scores); croak("range: out of memory"); } \
     EXTEND(SP, (SSize_t)((WS) ? col.n * 2 : col.n)); \
     for (size_t i_ = 0; i_ < col.n; i_++) { \
@@ -128,6 +128,24 @@ new_from_fd(class, fd)
   OUTPUT:
     RETVAL
 
+SV *
+new_readonly(class, path)
+    const char *class
+    SV *path
+  PREINIT:
+    char errbuf[SS_ERR_BUFLEN];
+  CODE:
+    /* Open a FROZEN (sealed) file read-only: O_RDONLY + PROT_READ, lock-free.
+       Requires ->freeze on the producer; a non-frozen file is refused. */
+    const char *p = (SvGETMAGIC(path), SvOK(path)) ? SvPV_nolen(path) : NULL;
+    if (!p) croak("Data::SortedSet::Shared->new_readonly: path is required");
+    SsHandle *h = ss_open_readonly(p, errbuf);
+    if (!h) croak("Data::SortedSet::Shared->new_readonly: %s", errbuf);
+    class = SvPV_nolen(ST(0));   /* re-read the class PV: path's get-magic may have moved ST(0) before the bless */
+    MAKE_OBJ(class, h);
+  OUTPUT:
+    RETVAL
+
 void
 DESTROY(self)
     SV *self
@@ -143,9 +161,9 @@ count(self)
   PREINIT:
     EXTRACT(self);
   CODE:
-    ss_rwlock_rdlock(h);
+    if (!h->readonly) ss_rwlock_rdlock(h);   /* frozen: immutable, no lock */
     RETVAL = h->hdr->count;
-    ss_rwlock_rdunlock(h);
+    if (!h->readonly) ss_rwlock_rdunlock(h);
   OUTPUT:
     RETVAL
 
@@ -160,12 +178,44 @@ max_entries(self)
     RETVAL
 
 void
+freeze(self)
+    SV *self
+  PREINIT:
+    EXTRACT(self);
+  CODE:
+    if (h->readonly) croak("Data::SortedSet::Shared->freeze: cannot freeze a read-only handle");
+    if (ss_freeze(h) != 0) croak("Data::SortedSet::Shared->freeze: msync: %s", strerror(errno));
+    h->readonly = 1;   /* this handle now rejects mutation too (the file is sealed) */
+
+UV
+frozen(self)
+    SV *self
+  PREINIT:
+    EXTRACT(self);
+  CODE:
+    RETVAL = h->hdr->sealed ? 1 : 0;
+  OUTPUT:
+    RETVAL
+
+UV
+readonly(self)
+    SV *self
+  PREINIT:
+    EXTRACT(self);
+  CODE:
+    RETVAL = h->readonly ? 1 : 0;
+  OUTPUT:
+    RETVAL
+
+void
 clear(self)
     SV *self
   PREINIT:
     EXTRACT(self);
   CODE:
+    if (h->readonly) croak("Data::SortedSet::Shared->clear: sorted set is frozen (read-only)");
     ss_rwlock_wrlock(h);
+    if (h->hdr->sealed) { ss_rwlock_wrunlock(h); croak("Data::SortedSet::Shared->clear: sorted set is frozen (read-only)"); }
     ss_clear_locked(h);
     ss_rwlock_wrunlock(h);
 
@@ -178,8 +228,10 @@ add(self, member, score)
     EXTRACT(self);
     int rc;
   CODE:
+    if (h->readonly) croak("Data::SortedSet::Shared->add: sorted set is frozen (read-only)");
     if (score != score) croak("add: score must not be NaN");
     ss_rwlock_wrlock(h);
+    if (h->hdr->sealed) { ss_rwlock_wrunlock(h); croak("Data::SortedSet::Shared->add: sorted set is frozen (read-only)"); }
     rc = ss_add_locked(h, (int64_t)member, (double)score);
     __atomic_fetch_add(&h->hdr->stat_ops, 1, __ATOMIC_RELAXED);
     ss_rwlock_wrunlock(h);
@@ -195,9 +247,9 @@ score(self, member)
     EXTRACT(self);
     double sc;
   CODE:
-    ss_rwlock_rdlock(h);
+    if (!h->readonly) ss_rwlock_rdlock(h);   /* frozen: immutable, no lock */
     int found = ss_idx_get(h, (int64_t)member, &sc);
-    ss_rwlock_rdunlock(h);
+    if (!h->readonly) ss_rwlock_rdunlock(h);
     RETVAL = found ? newSVnv(sc) : &PL_sv_undef;
   OUTPUT:
     RETVAL
@@ -210,9 +262,9 @@ exists(self, member)
     EXTRACT(self);
     double sc;
   CODE:
-    ss_rwlock_rdlock(h);
+    if (!h->readonly) ss_rwlock_rdlock(h);   /* frozen: immutable, no lock */
     RETVAL = ss_idx_get(h, (int64_t)member, &sc);
-    ss_rwlock_rdunlock(h);
+    if (!h->readonly) ss_rwlock_rdunlock(h);
   OUTPUT:
     RETVAL
 
@@ -223,7 +275,9 @@ remove(self, member)
   PREINIT:
     EXTRACT(self);
   CODE:
+    if (h->readonly) croak("Data::SortedSet::Shared->remove: sorted set is frozen (read-only)");
     ss_rwlock_wrlock(h);
+    if (h->hdr->sealed) { ss_rwlock_wrunlock(h); croak("Data::SortedSet::Shared->remove: sorted set is frozen (read-only)"); }
     RETVAL = ss_remove_locked(h, (int64_t)member);
     __atomic_fetch_add(&h->hdr->stat_ops, 1, __ATOMIC_RELAXED);
     ss_rwlock_wrunlock(h);
@@ -240,8 +294,10 @@ incr(self, member, delta)
     double out;
     int rc;
   CODE:
+    if (h->readonly) croak("Data::SortedSet::Shared->incr: sorted set is frozen (read-only)");
     if (delta != delta) croak("incr: delta must not be NaN");
     ss_rwlock_wrlock(h);
+    if (h->hdr->sealed) { ss_rwlock_wrunlock(h); croak("Data::SortedSet::Shared->incr: sorted set is frozen (read-only)"); }
     rc = ss_incr_locked(h, (int64_t)member, (double)delta, &out);
     __atomic_fetch_add(&h->hdr->stat_ops, 1, __ATOMIC_RELAXED);
     ss_rwlock_wrunlock(h);
@@ -259,7 +315,9 @@ pop_min(self)
   PPCODE:
     {
         int64_t m; double s; int ok;
+        if (h->readonly) croak("Data::SortedSet::Shared->pop_min: sorted set is frozen (read-only)");
         ss_rwlock_wrlock(h);
+        if (h->hdr->sealed) { ss_rwlock_wrunlock(h); croak("Data::SortedSet::Shared->pop_min: sorted set is frozen (read-only)"); }
         ok = ss_pop_locked(h, 0, &m, &s);
         if (ok) __atomic_fetch_add(&h->hdr->stat_ops, 1, __ATOMIC_RELAXED);
         ss_rwlock_wrunlock(h);
@@ -274,7 +332,9 @@ pop_max(self)
   PPCODE:
     {
         int64_t m; double s; int ok;
+        if (h->readonly) croak("Data::SortedSet::Shared->pop_max: sorted set is frozen (read-only)");
         ss_rwlock_wrlock(h);
+        if (h->hdr->sealed) { ss_rwlock_wrunlock(h); croak("Data::SortedSet::Shared->pop_max: sorted set is frozen (read-only)"); }
         ok = ss_pop_locked(h, 1, &m, &s);
         if (ok) __atomic_fetch_add(&h->hdr->stat_ops, 1, __ATOMIC_RELAXED);
         ss_rwlock_wrunlock(h);
@@ -287,9 +347,9 @@ _validate(self)
   PREINIT:
     EXTRACT(self);
   CODE:
-    ss_rwlock_rdlock(h);
+    if (!h->readonly) ss_rwlock_rdlock(h);   /* frozen: immutable, no lock */
     RETVAL = ss_validate_tree(h);
-    ss_rwlock_rdunlock(h);
+    if (!h->readonly) ss_rwlock_rdunlock(h);
   OUTPUT:
     RETVAL
 
@@ -303,10 +363,10 @@ rank(self, member)
   CODE:
     {
     UV rk = 0; int found;
-    ss_rwlock_rdlock(h);
+    if (!h->readonly) ss_rwlock_rdlock(h);   /* frozen: immutable, no lock */
     found = ss_idx_get(h, (int64_t)member, &sc);
     if (found) rk = ss_rank_of(h, sc, (int64_t)member);
-    ss_rwlock_rdunlock(h);
+    if (!h->readonly) ss_rwlock_rdunlock(h);
     RETVAL = found ? newSVuv(rk) : &PL_sv_undef;   /* build SV after unlock: an OOM in newSVuv must not strand the read lock */
     }
   OUTPUT:
@@ -322,10 +382,10 @@ rev_rank(self, member)
   CODE:
     {
     UV rk = 0; int found;
-    ss_rwlock_rdlock(h);
+    if (!h->readonly) ss_rwlock_rdlock(h);   /* frozen: immutable, no lock */
     found = ss_idx_get(h, (int64_t)member, &sc);
     if (found) rk = h->hdr->count - 1 - ss_rank_of(h, sc, (int64_t)member);
-    ss_rwlock_rdunlock(h);
+    if (!h->readonly) ss_rwlock_rdunlock(h);
     RETVAL = found ? newSVuv(rk) : &PL_sv_undef;   /* build SV after unlock */
     }
   OUTPUT:
@@ -340,7 +400,7 @@ at_rank(self, rank)
   CODE:
     {
     IV val = 0; int found = 0;
-    ss_rwlock_rdlock(h);
+    if (!h->readonly) ss_rwlock_rdlock(h);   /* frozen: immutable, no lock */
     {
         uint32_t cnt = h->hdr->count;
         IV r = rank; if (r < 0) r += (IV)cnt;
@@ -349,7 +409,7 @@ at_rank(self, rank)
             if (leaf != SS_NONE) { val = (IV)h->nodes[leaf].members[pos]; found = 1; }
         }
     }
-    ss_rwlock_rdunlock(h);
+    if (!h->readonly) ss_rwlock_rdunlock(h);
     RETVAL = found ? newSViv(val) : &PL_sv_undef;   /* build SV after unlock */
     }
   OUTPUT:
@@ -363,9 +423,9 @@ count_in_score(self, min, max)
   PREINIT:
     EXTRACT(self);
   CODE:
-    ss_rwlock_rdlock(h);
+    if (!h->readonly) ss_rwlock_rdlock(h);   /* frozen: immutable, no lock */
     RETVAL = ss_count_in_score(h, (double)min, (double)max, NULL);
-    ss_rwlock_rdunlock(h);
+    if (!h->readonly) ss_rwlock_rdunlock(h);
   OUTPUT:
     RETVAL
 
@@ -380,7 +440,7 @@ range_by_rank(self, start, stop, ...)
     int ws = 0;
     ss_parse_range_opts(aTHX_ &ST(0), 3, items, &ws, NULL, NULL);
     REEXTRACT(self);
-    ss_rwlock_rdlock(h);
+    if (!h->readonly) ss_rwlock_rdlock(h);   /* frozen: immutable, no lock */
     {
         uint32_t s0 = 0, len = 0;
         IV a, b;
@@ -399,7 +459,7 @@ rev_range_by_rank(self, start, stop, ...)
     int ws = 0;
     ss_parse_range_opts(aTHX_ &ST(0), 3, items, &ws, NULL, NULL);
     REEXTRACT(self);
-    ss_rwlock_rdlock(h);
+    if (!h->readonly) ss_rwlock_rdlock(h);   /* frozen: immutable, no lock */
     {
         uint32_t cnt = h->hdr->count, s0 = 0, len = 0;
         IV a, b;
@@ -418,7 +478,7 @@ range_by_score(self, min, max, ...)
     int ws = 0; IV limit = -1, offset = 0;
     ss_parse_range_opts(aTHX_ &ST(0), 3, items, &ws, &limit, &offset);
     REEXTRACT(self);
-    ss_rwlock_rdlock(h);
+    if (!h->readonly) ss_rwlock_rdlock(h);   /* frozen: immutable, no lock */
     {
         uint32_t lo;
         uint32_t win = ss_count_in_score(h, (double)min, (double)max, &lo);
@@ -439,7 +499,7 @@ rev_range_by_score(self, max, min, ...)
     int ws = 0; IV limit = -1, offset = 0;
     ss_parse_range_opts(aTHX_ &ST(0), 3, items, &ws, &limit, &offset);
     REEXTRACT(self);
-    ss_rwlock_rdlock(h);
+    if (!h->readonly) ss_rwlock_rdlock(h);   /* frozen: immutable, no lock */
     {
         uint32_t lo;
         uint32_t win = ss_count_in_score(h, (double)min, (double)max, &lo);
@@ -456,15 +516,15 @@ peek_min(self)
   PREINIT:
     EXTRACT(self);
   PPCODE:
-    ss_rwlock_rdlock(h);
+    if (!h->readonly) ss_rwlock_rdlock(h);   /* frozen: immutable, no lock */
     if (h->hdr->root != SS_NONE && ss_node_ok(h, h->hdr->leftmost)) {
         SsNode *nd = &h->nodes[h->hdr->leftmost];
         IV m = (IV)nd->members[0]; NV s = nd->scores[0];
-        ss_rwlock_rdunlock(h);
+        if (!h->readonly) ss_rwlock_rdunlock(h);
         EXTEND(SP, 2);
         PUSHs(sv_2mortal(newSViv(m)));
         PUSHs(sv_2mortal(newSVnv(s)));
-    } else ss_rwlock_rdunlock(h);
+    } else if (!h->readonly) ss_rwlock_rdunlock(h);
 
 void
 peek_max(self)
@@ -472,15 +532,15 @@ peek_max(self)
   PREINIT:
     EXTRACT(self);
   PPCODE:
-    ss_rwlock_rdlock(h);
+    if (!h->readonly) ss_rwlock_rdlock(h);   /* frozen: immutable, no lock */
     if (h->hdr->root != SS_NONE && ss_node_ok(h, h->hdr->rightmost)) {
         SsNode *nd = &h->nodes[h->hdr->rightmost];
         IV m = (IV)nd->members[nd->num - 1]; NV s = nd->scores[nd->num - 1];
-        ss_rwlock_rdunlock(h);
+        if (!h->readonly) ss_rwlock_rdunlock(h);
         EXTEND(SP, 2);
         PUSHs(sv_2mortal(newSViv(m)));
         PUSHs(sv_2mortal(newSVnv(s)));
-    } else ss_rwlock_rdunlock(h);
+    } else if (!h->readonly) ss_rwlock_rdunlock(h);
 
 void
 each(self, cb)
@@ -494,9 +554,9 @@ each(self, cb)
     {
         ss_rcollect_t col = { NULL, NULL, 0, 0 };
         REEXTRACT(self);
-        ss_rwlock_rdlock(h);
+        if (!h->readonly) ss_rwlock_rdlock(h);   /* frozen: immutable, no lock */
         int ok = ss_collect_range(h, 0, h->hdr->count, 0, &col);
-        ss_rwlock_rdunlock(h);
+        if (!h->readonly) ss_rwlock_rdunlock(h);
         if (!ok) { free(col.members); free(col.scores); croak("each: out of memory"); }
         for (size_t i = 0; i < col.n; i++) {
             dSP; ENTER; SAVETMPS; PUSHMARK(SP);
@@ -536,7 +596,7 @@ sync(self)
   PREINIT:
     EXTRACT(self);
   CODE:
-    if (ss_msync(h) != 0) croak("sync: %s", strerror(errno));
+    if (!h->readonly && ss_msync(h) != 0) croak("sync: %s", strerror(errno));   /* no-op on a read-only view */
 
 void
 unlink(self, ...)
@@ -605,6 +665,7 @@ add_many(self, rows)
     EXTRACT(self);
     int added = 0;
   CODE:
+    if (h->readonly) croak("Data::SortedSet::Shared->add_many: sorted set is frozen (read-only)");
     SvGETMAGIC(rows);
     if (!SvROK(rows) || SvTYPE(SvRV(rows)) != SVt_PVAV)
         croak("add_many: expected an arrayref of [member, score] rows");
@@ -653,6 +714,7 @@ add_many(self, rows)
         }
         REEXTRACT(self);
         ss_rwlock_wrlock(h);
+        if (h->hdr->sealed) { ss_rwlock_wrunlock(h); croak("Data::SortedSet::Shared->add_many: sorted set is frozen (read-only)"); }
         for (SSize_t i = 0; i < n; i++) {
             int rc = ss_add_locked(h, mem[i], sco[i]);
             if (rc == 1) added++;
@@ -678,7 +740,7 @@ stats(self)
         /* Snapshot the header fields under the lock; do all (croak-capable) Perl
            allocation after releasing it -- an OOM in newHV/newSVuv must never
            strand the read lock. */
-        ss_rwlock_rdlock(h);
+        if (!h->readonly) ss_rwlock_rdlock(h);   /* frozen: immutable, no lock */
         SsHeader *hd = h->hdr;
         uint32_t nfree = 0, f = hd->node_free_head;
         /* node_free_head / parent free-links are file-stored: bound the index and
@@ -692,7 +754,7 @@ stats(self)
         index_slots   = hd->index_slots;
         nodes_used    = hd->node_capacity - nfree;
         ops           = hd->stat_ops;
-        ss_rwlock_rdunlock(h);
+        if (!h->readonly) ss_rwlock_rdunlock(h);
 
         HV *hv = newHV();
         hv_stores(hv, "count",         newSVuv(count));
@@ -704,6 +766,8 @@ stats(self)
         hv_stores(hv, "index_load",    newSVnv((double)count / (double)index_slots));
         hv_stores(hv, "ops",           newSVuv(ops));
         hv_stores(hv, "mmap_size",     newSVuv((UV)h->mmap_size));
+        hv_stores(hv, "frozen",        newSVuv(h->hdr->sealed ? 1 : 0));
+        hv_stores(hv, "readonly",      newSVuv(h->readonly ? 1 : 0));
         RETVAL = newRV_noinc((SV *)hv);
     }
   OUTPUT:

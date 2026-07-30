@@ -1,6 +1,9 @@
 Revision history for Data-SortedSet-Shared
 
 0.04      2026-07-23
+          - Add a frozen read-only mode: freeze() seals a file-backed sorted
+            set immutable; new_readonly() opens it O_RDONLY / PROT_READ and
+            queries it lock-free.
           - Refuse an insert when the node pool cannot satisfy the worst-case
             split, instead of writing through an out-of-range node index if
             the free list is exhausted or corrupt.

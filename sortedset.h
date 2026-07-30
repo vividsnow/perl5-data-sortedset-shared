@@ -124,7 +124,8 @@ struct SsHeader {
     uint32_t drain_seq;               /* 84  futex bumped by a reader releasing under a draining writer (wakes it) */
     uint64_t stat_ops;                /* 88 */
     uint32_t slotless_rdepth;         /* 96: readers holding with no reader-slot (documented residual) */
-    uint8_t  _pad[156];               /* 100..255 */
+    uint8_t  sealed;                  /* 100  0 = mutable, 1 = frozen (read-only; lock-free reads) */
+    uint8_t  _pad[155];               /* 101..255 */
 };
 typedef struct SsHeader SsHeader;
 
@@ -148,6 +149,7 @@ typedef struct SsHandle {
     uint32_t      cached_pid;    /* getpid() cached at last slot claim */
     uint32_t      cached_fork_gen; /* ss_fork_gen value at last slot claim */
     uint32_t slotless_held; /* rwlock read-locks held with no reader-slot */
+    int      readonly;      /* 1 = frozen O_RDONLY/PROT_READ view: lock-free reads, mutation croaks */
 } SsHandle;
 
 /* ================================================================
@@ -720,6 +722,10 @@ static SsHandle *ss_create(const char *path, uint32_t max_entries, mode_t mode, 
             if (!ss_validate_header((SsHeader *)base, (uint64_t)st.st_size)) {
                 SS_ERR("invalid sorted-set file"); munmap(base, map_size); flock(fd, LOCK_UN); close(fd); return NULL;
             }
+            if (((SsHeader *)base)->sealed) {   /* a frozen file must never be reopened read-write */
+                SS_ERR("%s is frozen (read-only); open it with new_readonly", path);
+                munmap(base, map_size); flock(fd, LOCK_UN); close(fd); return NULL;
+            }
             flock(fd, LOCK_UN); close(fd);
             return ss_setup(base, map_size, path, -1);
         }
@@ -757,6 +763,10 @@ static SsHandle *ss_open_fd(int fd, char *errbuf) {
     if (!ss_validate_header((SsHeader *)base, (uint64_t)st.st_size)) {
         SS_ERR("invalid sorted-set"); munmap(base, ms); return NULL;
     }
+    if (((SsHeader *)base)->sealed) {   /* a frozen file must never be reopened read-write */
+        SS_ERR("this sorted set is frozen (read-only); open it with new_readonly");
+        munmap(base, ms); return NULL;
+    }
     int myfd = fcntl(fd, F_DUPFD_CLOEXEC, 0);
     if (myfd < 0) { SS_ERR("fcntl: %s", strerror(errno)); munmap(base, ms); return NULL; }
     return ss_setup(base, ms, NULL, myfd);
@@ -788,6 +798,54 @@ static void ss_destroy(SsHandle *h) {
 static inline int ss_msync(SsHandle *h) {
     if (!h || !h->hdr) return 0;
     return msync(h->hdr, h->mmap_size, MS_SYNC);
+}
+
+/* Open a FROZEN (sealed) file read-only: O_RDONLY + PROT_READ, no lock ever.
+ * A sealed set's B+tree, leaf links, order-statistics counts and member index
+ * are immutable, and every read path (score / rank / at_rank / count_in_score /
+ * range / iteration) walks with a process-local cursor and pushes results into a
+ * process-local buffer -- it never writes the mapping -- so those queries read
+ * directly with no reader-slot / rwlock traffic.  Because the mapping is never
+ * written, a read-only view works from a read-only fd / read-only filesystem and
+ * any number of processes can share one PROT_READ mapping (same architecture;
+ * the native magic rejects a wrong-endian file at validation). */
+static SsHandle *ss_open_readonly(const char *path, char *errbuf) {
+    if (errbuf) errbuf[0] = '\0';
+    int fd = open(path, O_RDONLY|O_NOFOLLOW|O_CLOEXEC);
+    if (fd < 0) { SS_ERR("open %s: %s", path, strerror(errno)); return NULL; }
+    struct stat st;
+    if (fstat(fd, &st) < 0) { SS_ERR("fstat %s: %s", path, strerror(errno)); close(fd); return NULL; }
+    if ((uint64_t)st.st_size < sizeof(SsHeader)) { SS_ERR("%s: file too small", path); close(fd); return NULL; }
+    size_t ms = (size_t)st.st_size;
+    void *base = mmap(NULL, ms, PROT_READ, MAP_SHARED, fd, 0);
+    close(fd);   /* the mapping keeps the file; a read-only view needs no fd (no msync/ftruncate) */
+    if (base == MAP_FAILED) { SS_ERR("mmap %s: %s", path, strerror(errno)); return NULL; }
+    if (!ss_validate_header((SsHeader *)base, (uint64_t)st.st_size)) {
+        SS_ERR("%s: invalid sorted-set file", path); munmap(base, ms); return NULL;
+    }
+    if (!((SsHeader *)base)->sealed) {
+        SS_ERR("%s is not frozen: call ->freeze on the producer before opening read-only", path);
+        munmap(base, ms); return NULL;
+    }
+    SsHandle *h = ss_setup(base, ms, path, -1);   /* munmaps on OOM */
+    if (!h) { SS_ERR("out of memory"); return NULL; }
+    h->readonly = 1;
+    return h;
+}
+
+/* Seal a sorted set: make it permanently immutable so it can be shipped and
+ * opened read-only.  Takes the write lock so no mutation is in flight, publishes
+ * the seal, then flushes it (file/memfd-backed).  The order-statistics B+tree is
+ * maintained EAGERLY on every write (subtree counts, leaf links and separators
+ * are all kept up to date in add/remove/incr) -- there is no deferred/lazy build
+ * to force-complete, so the sealed tree is already query-ready for the lock-free
+ * read path.  Afterwards every mutator croaks and a read-write reopen is refused. */
+static int ss_freeze(SsHandle *h) {
+    ss_rwlock_wrlock(h);
+    h->hdr->sealed = 1;
+    ss_rwlock_wrunlock(h);
+    if (h->path || h->backing_fd >= 0) return ss_msync(h);  /* durability for file/memfd-backed */
+    return 0;   /* anonymous: the seal lives in shared memory (visible to forks); nothing to flush */
 }
 
 static int ss_create_eventfd(SsHandle *h) {
