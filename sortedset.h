@@ -578,7 +578,6 @@ static inline void ss_init_header(void *base, uint32_t max_entries, uint32_t ind
     SsLayout L = ss_layout(index_slots);
     SsHeader *hdr = (SsHeader *)base;
     memset(base, 0, (size_t)total);
-    hdr->magic            = SS_MAGIC;
     hdr->version          = SS_VERSION;
     hdr->max_entries      = max_entries;
     hdr->node_capacity    = node_capacity;
@@ -599,6 +598,11 @@ static inline void ss_init_header(void *base, uint32_t max_entries, uint32_t ind
         nodes[i].parent = (i + 1 < node_capacity) ? (i + 1) : SS_NONE;
     hdr->node_free_head = 0;
     /* index region left zeroed: every slot empty (state == 0). */
+    /* Publish magic LAST, as a release store: it is the commit point, so a
+       creator killed before this store leaves magic==0 -- which the
+       crashed-creator recovery treats as an abandoned mid-init file and
+       recovers, instead of a magic-set-but-incomplete header that would brick. */
+    __atomic_store_n(&hdr->magic, SS_MAGIC, __ATOMIC_RELEASE);
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
 }
 
@@ -683,6 +687,16 @@ static int ss_secure_open(const char *path, mode_t mode, char *errbuf) {
     return -1;
 }
 
+/* True iff the whole mapped region is zero. A freshly ftruncate'd file (the only
+   thing an abandoned mid-init creator leaves) reads as all zeros, so this lets the
+   recovery re-init ONLY a provably-empty file and never a same-owner file that
+   merely starts with a zero word. Recovery is a cold path, so a byte scan is fine. */
+static inline int ss_region_is_zero(const void *p, size_t n) {
+    const unsigned char *b = (const unsigned char *)p;
+    for (size_t i = 0; i < n; i++) if (b[i]) return 0;
+    return 1;
+}
+
 static SsHandle *ss_create(const char *path, uint32_t max_entries, mode_t mode, char *errbuf) {
     uint32_t index_slots, node_capacity;
     if (!ss_validate_create_args(max_entries, &index_slots, &node_capacity, errbuf)) return NULL;
@@ -727,7 +741,7 @@ static SsHandle *ss_create(const char *path, uint32_t max_entries, mode_t mode, 
                  * size, still uninitialized (magic==0), and owned by us -- a valid
                  * or foreign file fails this and still errors, never clobbered. */
                 if (((SsHeader *)base)->magic == 0 && (uint64_t)st.st_size == total
-                    && st.st_uid == geteuid()) {
+                    && st.st_uid == geteuid() && ss_region_is_zero(base, map_size)) {
                     if (fchmod(fd, mode) < 0) {
                         SS_ERR("%s: fchmod: %s", path, strerror(errno));
                         munmap(base, map_size); flock(fd, LOCK_UN); close(fd); return NULL;

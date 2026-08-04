@@ -92,7 +92,7 @@ new(class, path, max_entries, ...)
     mode_t mode = (items > 3 && (SvGETMAGIC(ST(3)), SvOK(ST(3)))) ? (mode_t)SvUV(ST(3)) : 0600;
     const char *p = (SvGETMAGIC(path), SvOK(path)) ? SvPV_nolen(path) : NULL;
     SsHandle *h = ss_create(p, (uint32_t)max_entries, mode, errbuf);
-    if (!h) croak("Data::SortedSet::Shared->new: %s", errbuf);
+    if (!h) croak("Data::SortedSet::Shared->new: %s", errbuf[0] ? errbuf : "out of memory");
     MAKE_OBJ(class, h);
   OUTPUT:
     RETVAL
@@ -110,7 +110,7 @@ new_memfd(class, name, max_entries)
        get-magic runs arbitrary Perl that can realloc/free name's PV */
     const char *nm = (SvGETMAGIC(name), SvOK(name)) ? SvPV_nolen(name) : NULL;
     SsHandle *h = ss_create_memfd(nm, (uint32_t)max_entries, errbuf);
-    if (!h) croak("Data::SortedSet::Shared->new_memfd: %s", errbuf);
+    if (!h) croak("Data::SortedSet::Shared->new_memfd: %s", errbuf[0] ? errbuf : "out of memory");
     MAKE_OBJ(class, h);
   OUTPUT:
     RETVAL
@@ -123,7 +123,7 @@ new_from_fd(class, fd)
     char errbuf[SS_ERR_BUFLEN];
   CODE:
     SsHandle *h = ss_open_fd(fd, errbuf);
-    if (!h) croak("Data::SortedSet::Shared->new_from_fd: %s", errbuf);
+    if (!h) croak("Data::SortedSet::Shared->new_from_fd: %s", errbuf[0] ? errbuf : "out of memory");
     MAKE_OBJ(class, h);
   OUTPUT:
     RETVAL
