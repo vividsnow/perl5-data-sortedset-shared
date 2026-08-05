@@ -746,7 +746,6 @@ static SsHandle *ss_create(const char *path, uint32_t max_entries, mode_t mode, 
                         SS_ERR("%s: fchmod: %s", path, strerror(errno));
                         munmap(base, map_size); flock(fd, LOCK_UN); close(fd); return NULL;
                     }
-                    memset(base, 0, map_size);   /* start from a provably empty sorted set */
                     ss_init_header(base, max_entries, index_slots, node_capacity, total);
                     flock(fd, LOCK_UN); close(fd);
                     return ss_setup(base, map_size, path, -1);
