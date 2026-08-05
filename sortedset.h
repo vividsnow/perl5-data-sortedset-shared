@@ -599,9 +599,10 @@ static inline void ss_init_header(void *base, uint32_t max_entries, uint32_t ind
     hdr->node_free_head = 0;
     /* index region left zeroed: every slot empty (state == 0). */
     /* Publish magic LAST, as a release store: it is the commit point, so a
-       creator killed before this store leaves magic==0 -- which the
-       crashed-creator recovery treats as an abandoned mid-init file and
-       recovers, instead of a magic-set-but-incomplete header that would brick. */
+       creator killed before it leaves magic==0 and the file is never mistaken
+       for a valid one.  Recovery re-initializes such a file only while it is
+       still all-zero (a kill during the ftruncate or the zeroing above); a kill
+       during the few field stores leaves a file to remove by hand. */
     __atomic_store_n(&hdr->magic, SS_MAGIC, __ATOMIC_RELEASE);
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
 }
@@ -749,6 +750,11 @@ static SsHandle *ss_create(const char *path, uint32_t max_entries, mode_t mode, 
                     ss_init_header(base, max_entries, index_slots, node_capacity, total);
                     flock(fd, LOCK_UN); close(fd);
                     return ss_setup(base, map_size, path, -1);
+                }
+                if (((SsHeader *)base)->magic == 0 && (uint64_t)st.st_size == total
+                    && st.st_uid == geteuid()) {
+                    SS_ERR("%s: incomplete sorted-set file left by an interrupted create; remove it and retry", path);
+                    munmap(base, map_size); flock(fd, LOCK_UN); close(fd); return NULL;
                 }
                 SS_ERR("invalid sorted-set file"); munmap(base, map_size); flock(fd, LOCK_UN); close(fd); return NULL;
             }
